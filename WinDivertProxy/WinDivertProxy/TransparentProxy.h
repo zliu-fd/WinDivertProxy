@@ -16,7 +16,17 @@ struct EndPoint{
 	UINT32 addr;
 	USHORT port;
 
-	bool operator<(const EndPoint &ep) const { return (addr < ep.addr || port < ep.port); }
+	bool operator<(const EndPoint &ep) const { return (addr < ep.addr || (addr == ep.addr && port < ep.port)); }
+	bool operator==(const EndPoint &ep) const { return (addr == ep.addr && port == ep.port); }
+	bool operator>(const EndPoint &ep) const { return (addr > ep.addr || (addr == ep.addr && port > ep.port)); }
+
+	EndPoint()	{ }
+
+	EndPoint(UINT32 _addr, USHORT _port)
+	{
+		addr = _addr;
+		port = _port;
+	}
 };
 
 
@@ -26,10 +36,14 @@ private:
 	std::map<EndPoint, EndPoint>* ClientToServerMap;
 	bool Monitoring;
 	std::thread* MonitorThread;
-	HANDLE handle;
+	HANDLE WinDivertHandle;
 
-	void Request(unsigned char *packet);
-	void Response(unsigned char *packet);
+	void Request(unsigned char* packet, UINT packetLen, PDIVERT_IPHDR iphdr, PDIVERT_TCPHDR tcphdr, WINDIVERT_ADDRESS addr, PVOID data = NULL, UINT data_len = 0);
+	void RequestHTTPS(unsigned char* packet, UINT packetLen, PDIVERT_IPHDR iphdr, PDIVERT_TCPHDR tcphdr, WINDIVERT_ADDRESS addr, PVOID data = NULL, UINT data_len = 0);
+	void Response(unsigned char* packet, UINT packetLen, PDIVERT_IPHDR iphdr, PDIVERT_TCPHDR tcphdr, WINDIVERT_ADDRESS addr, PVOID data = NULL, UINT data_len = 0);
+	void LogRedirect(UINT32 srcAddr, USHORT srcPort, UINT32 proxyAddr, USHORT proxyPort, UINT32 dstAddr, USHORT dstPort, int direction);
+	std::string ConvertIP(UINT32 addr);
+	UINT ConstructPacket(unsigned char* buffer, UINT bufferLen, UINT32 srcAddr, USHORT srcPort, UINT32 dstAddr, USHORT dstPort, char* content, UINT contentLen);
 
 
 public:
