@@ -9,8 +9,8 @@
 
 int _tmain(int argc, _TCHAR* argv[])
 {
-	std::string ProxyAddr = "10.156.81.34";
-	int ProxyPort = 443;
+	std::string ProxyAddr = "10.156.81.66";
+	int ProxyPort = 8888;
 
 	TransparentProxy proxy(ProxyAddr, ProxyPort);
 	proxy.Start();

@@ -4,26 +4,33 @@
 
 TransparentProxy::TransparentProxy(std::string proxyAddr, USHORT proxyPort)
 {
+	ReadableProxyAddr = proxyAddr;
+	ReadableProxyPort = proxyPort;
 	ProxyAddr = inet_addr(proxyAddr.c_str());
 	ProxyPort = htons(proxyPort);
-	ClientToServerMap = new std::map<EndPoint, EndPoint>();
 	Monitoring = false;
 	MonitorThread = NULL;
 	Debug = true;
+	debugCount = 0;
 }
 
 
 TransparentProxy::~TransparentProxy(void)
 {
-	delete ClientToServerMap;
+	ClientToServerMap.clear();
 }
 
 int TransparentProxy::Start()
 {
+	std::string filter = "(outbound and ip.DstAddr == 157.55.50.185 and tcp.DstPort == 443) or ";
+	char buf[50];
+	sprintf(buf, "(inbound and tcp.SrcPort == %d)", ReadableProxyPort);
+	filter += buf;
+		
+
 	std::cout << "Starting WinDivert ..." << std::endl;
 	WinDivertHandle = WinDivertOpen(
-		"(outbound and tcp.DstPort == 443) or "
-		"(inbound and tcp.SrcPort == 443)",
+		filter.c_str(),
 		WINDIVERT_LAYER_NETWORK,
 		0,
 		0);
@@ -76,10 +83,10 @@ void TransparentProxy::Monitor()
 				{
 					EndPoint srcEndPoint(iphdr->SrcAddr,  tcphdr->SrcPort);
 					EndPoint dstEndPoint(iphdr->DstAddr, tcphdr->DstPort);
-					(*ClientToServerMap)[srcEndPoint] = dstEndPoint;
+					ClientToServerMap[srcEndPoint] = dstEndPoint;
 					Request(packet, packetLen, iphdr, tcphdr, addr, data, data_len);
 				}
-				else if(ntohs(tcphdr->SrcPort) == 443)
+				else if(tcphdr->SrcPort == ProxyPort)
 				{
 					Response(packet, packetLen, iphdr, tcphdr, addr, data, data_len);
 				}				
@@ -92,13 +99,12 @@ void TransparentProxy::Request(unsigned char *packet, UINT packetLen, PDIVERT_IP
 {
 	if(Debug) LogRedirect(iphdr->SrcAddr, tcphdr->SrcPort, ProxyAddr, ProxyPort, iphdr->DstAddr, tcphdr->DstPort, WINDIVERT_DIRECTION_OUTBOUND);
 
-	/*
+	
 	if(ntohs(tcphdr->DstPort) == 443)
 	{
 		RequestHTTPS(packet, packetLen, iphdr, tcphdr, addr, data, data_len);
 	}
 	else
-	*/
 	{
 		iphdr->DstAddr = ProxyAddr;
 		tcphdr->DstPort = ProxyPort;
@@ -115,19 +121,39 @@ void TransparentProxy::Request(unsigned char *packet, UINT packetLen, PDIVERT_IP
 
 void TransparentProxy::Response(unsigned char* packet, UINT packetLen, PDIVERT_IPHDR iphdr, PDIVERT_TCPHDR tcphdr, WINDIVERT_ADDRESS addr, PVOID data, UINT data_len)
 {
+	std::cout << "Data_Len: " << data_len << std::endl;
+
 	EndPoint dstEndPoint(iphdr->DstAddr, tcphdr->DstPort);
 
-	if(ClientToServerMap->find(dstEndPoint) == ClientToServerMap->end())
+	if(ClientToServerMap.find(dstEndPoint) == ClientToServerMap.end())
 	{
 		if(Debug) std::cout << "x Warning unseen traffics." << std::endl;
 	}
 	else
 	{
-		EndPoint originalDstEP = (*ClientToServerMap)[dstEndPoint];
+		EndPoint originalDstEP = ClientToServerMap[dstEndPoint];
 		iphdr->SrcAddr = originalDstEP.addr;
 		tcphdr->SrcPort = originalDstEP.port;
 
 		if(Debug) LogRedirect(iphdr->SrcAddr, tcphdr->SrcPort, ProxyAddr, ProxyPort, iphdr->DstAddr, tcphdr->DstPort, WINDIVERT_DIRECTION_INBOUND);
+
+		// Modify Response TCP Sequence Number
+		if(InSNMap.find(dstEndPoint) != InSNMap.end())
+		{
+			UINT32 originalSeqNum =  tcphdr->SeqNum;
+			tcphdr->SeqNum = InSNMap[dstEndPoint][originalSeqNum];
+			std::cout << "SEQ: " << originalSeqNum << " >> " << tcphdr->SeqNum << std::endl;
+			UINT32 nextSeqNum = htonl(ntohl(originalSeqNum) + data_len);
+			InSNMap[dstEndPoint][nextSeqNum] = htonl(ntohl(tcphdr->SeqNum) + data_len);
+			InOrignalToActualACKMap[dstEndPoint][htonl(ntohl(tcphdr->SeqNum) + data_len)] = nextSeqNum;
+		}
+		// Modify Response TCP ACK Number
+		if(OutSNMap.find(dstEndPoint) != OutSNMap.end())
+		{
+			UINT32 originalACKNum =  tcphdr->AckNum;
+			tcphdr->AckNum = OutSNMap[dstEndPoint][originalACKNum];
+			std::cout << "ACK: " << originalACKNum << " >> " << tcphdr->AckNum << std::endl;
+		}
 
 		DivertHelperCalcChecksums(packet, packetLen, 0);
 		UINT writeLen;
@@ -145,7 +171,8 @@ void TransparentProxy::RequestHTTPS(unsigned char* packet, UINT packetLen, PDIVE
 		char connectionString[100];
 		char* endConnectString = "\r\n";
 
-		std::cout << "Data: " << data << std::endl;
+		EndPoint srcEP(iphdr->SrcAddr, tcphdr->SrcPort);
+
 		std::cout << "Data_Len: " << data_len << std::endl;
 
 		if(data != NULL && data_len >= 6)
@@ -164,13 +191,13 @@ void TransparentProxy::RequestHTTPS(unsigned char* packet, UINT packetLen, PDIVE
 
 				unsigned char connectPacket[MAXBUF];
 				
-				for(int i = 0; i< packetLen;i++)
+				for(UINT i = 0; i < packetLen;i++)
 				{
 					connectPacket[i] = packet[i];
 				}
 
 				int connectPacketLen = packetLen;
-				for(int i = 0;i < connectLen;i++)
+				for(UINT i = 0;i < connectLen;i++)
 				{
 					connectPacket[packetLen - data_len + i] = connectionString[i];
 				}
@@ -195,37 +222,56 @@ void TransparentProxy::RequestHTTPS(unsigned char* packet, UINT packetLen, PDIVE
 					std::cout << "Failed to redirect packet." << std::endl;
 					std::cerr << "Error Code: " << GetLastError() << std::endl; 
 				}
-
-				std::cout << "Sequence Number" << ntohl(tcphdr->SeqNum) << std::endl;
+				EndPoint ep(iphdr->SrcAddr, tcphdr->SrcPort);
+				CurrentSNMap[ep] = htonl(ntohl(tcphdr->SeqNum) + connectLen);
 
 				unsigned char respPacket[MAXBUF];
 				UINT respPacketLen;
 				WINDIVERT_ADDRESS respAddr;
 				bool established = false;
 				int count = 0;
+				int bytesCount = 0;
 				char* connectEstablished = "HTTP/1.1 200 Connection Established\r\n";
 				while(!established){
 					WinDivertRecv(WinDivertHandle, respPacket, MAXBUF, &respAddr, &respPacketLen);
 					DivertHelperParsePacket(respPacket, respPacketLen, &connectIphdr, NULL, NULL, NULL, &connectTcphdr, NULL, &connectData, &connectLen);
-					if(connectLen >= strlen(connectEstablished))
+					bytesCount += connectLen;
+					std::cout << "Count: " << ++count << std::endl;
+					if(StartWith((char*)connectData, connectEstablished))
 					{
-						std::cout << "Count: " << ++count << std::endl;
-						char* p = (char*)connectData;
-						// std::cout << p << std::endl;
-						if(p[0] == 'H' && p[1] == 'T' && p[2] == 'T' && p[3] == 'P')
-						{
-							established = true;
-							std::cout << "Get HTTP 200" << std::endl;
-						}
+						established = true;
+						std::cout << "HTTP/1.1 200 Connection Established" << std::endl;
 					}
 				}
+				debugCount++;
+
 				tcphdr->AckNum = htonl(ntohl(connectTcphdr->SeqNum) + connectLen);
+				bytesCount -= connectLen;
+				InSNMap[srcEP][tcphdr->AckNum] = htonl(ntohl(connectTcphdr->SeqNum) - bytesCount);
 			}
 		}
 
 		// Redirect to Proxy
 		iphdr->DstAddr = ProxyAddr;
 		tcphdr->DstPort = ProxyPort;
+
+		// Modify TCP Sequence Number
+		if(CurrentSNMap.find(srcEP) != CurrentSNMap.end())
+		{
+			UINT32 originalSEQNum = tcphdr->SeqNum;
+			UINT32 originalACKNum = htonl(ntohl(tcphdr->SeqNum) + data_len);
+			tcphdr->SeqNum = CurrentSNMap[srcEP];
+			CurrentSNMap[srcEP] = htonl(ntohl(tcphdr->SeqNum) + data_len);
+			OutSNMap[srcEP][CurrentSNMap[srcEP]] = originalACKNum;
+			std::cout << "SEQ: " << originalSEQNum << " >> " << tcphdr->SeqNum << std::endl;
+		}
+		// Modify TCP ACK Number
+		if(InOrignalToActualACKMap.find(srcEP) != InOrignalToActualACKMap.end())
+		{
+			UINT32 originalACKNum = tcphdr->AckNum;
+			tcphdr->AckNum = InOrignalToActualACKMap[srcEP][tcphdr->AckNum];
+			std::cout << "ACK: " << originalACKNum << " >> " << tcphdr->AckNum << std::endl;
+		}
 
 		DivertHelperCalcChecksums(packet, packetLen, 0);
 		UINT writeLen;
@@ -237,9 +283,16 @@ void TransparentProxy::RequestHTTPS(unsigned char* packet, UINT packetLen, PDIVE
 
 }
 
-UINT ConstructPacket(unsigned char* buffer, UINT bufferLen, UINT32 srcAddr, USHORT srcPort, UINT32 dstAddr, USHORT dstPort, char* content, UINT contentLen)
+bool TransparentProxy::StartWith(char* srcStr, char* subStr)
 {
-	return 0;
+	if(subStr == NULL) return true;
+	if(srcStr == NULL && subStr != NULL) return false;
+	if(strlen(srcStr) < strlen(subStr)) return false;
+	for(UINT i = 0;i < strlen(subStr);i++)
+	{
+		if(srcStr[i] != subStr[i]) return false;
+	}
+	return true;
 }
 
 std::string TransparentProxy::ConvertIP(UINT32 addr)
